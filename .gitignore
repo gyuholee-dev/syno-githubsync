@@ -163,3 +163,7 @@ configs/
 # installer
 installers/
 *.msi
+
+# Python
+__pycache__/
+*.pyc
