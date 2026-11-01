@@ -120,9 +120,21 @@ cd /<볼륨>/<공유폴더>/githubsync || exit 4
 LOG=backup.log
 
 echo "===== $(date '+%Y-%m-%d %H:%M:%S') =====" >> "$LOG"
-python3 -B github_backup.py >> "$LOG" 2>&1
-status=$?
+start=$(wc -l < "$LOG")
+
+if [ ! -r github_backup.py ]; then
+    echo "github_backup.py 를 읽을 수 없음: 파일 소유자와 권한을 확인하세요 (실행 계정: $(id -un))" >> "$LOG"
+    status=2
+else
+    python3 -B github_backup.py >> "$LOG" 2>&1
+    status=$?
+fi
 echo "exit code: $status" >> "$LOG"
+
+# 실패하면 이번 실행의 로그를 출력해 알림 메일에서 원인을 볼 수 있게 한다
+if [ $status -ne 0 ]; then
+    tail -n +$((start + 1)) "$LOG" | tail -n 20
+fi
 
 # 로그가 무한히 커지지 않도록 마지막 2000줄만 남긴다
 tail -n 2000 "$LOG" > "$LOG.tmp" && mv "$LOG.tmp" "$LOG"

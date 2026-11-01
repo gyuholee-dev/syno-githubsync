@@ -11,6 +11,7 @@ import base64
 import datetime
 import json
 import os
+import pwd
 import re
 import shutil
 import signal
@@ -27,8 +28,9 @@ API_TIMEOUT = 30
 GIT_TIMEOUT = 3600
 REPO_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 RETRY_DELAYS = (5, 15)  # 일시적 오류 시 재시도 전 대기(초). 항목 수만큼 재시도한다.
-GIT_NO_RETRY = ("Authentication failed", "Permission denied",
+GIT_NO_RETRY = ("Authentication failed", "Permission denied", "dubious ownership",
                 "error: 401", "error: 403", "error: 404", "not found")
+OWNER_ERROR = "폴더 소유자가 실행 계정과 다름"
 TOKEN_WARN_DAYS = 14
 EXIT_TOKEN_EXPIRING = 5
 LOCK_MAX_AGE = 12 * 3600
@@ -276,6 +278,20 @@ def apply_rename(dest, old, full_name, auth_header):
         log("경고: 원격 주소 갱신 실패(%s): %s" % (new, err))
 
 
+def explain_git_error(err):
+    """git 오류 메시지 중 원인을 알려 줄 수 있는 것은 짧은 설명으로 바꾼다."""
+    return OWNER_ERROR if "dubious ownership" in err else err
+
+
+def log_owner_hint(dest):
+    try:
+        user = pwd.getpwuid(os.geteuid()).pw_name
+    except KeyError:
+        user = str(os.geteuid())
+    log("조치: 백업 폴더의 소유자를 실행 계정(%s)으로 바꾸세요 → sudo chown -R %s %s"
+        % (user, user, dest))
+
+
 def backup_repo(full_name, dest, work_dir, auth_header):
     name = repo_dir_name(full_name)
     if name is None:
@@ -284,7 +300,7 @@ def backup_repo(full_name, dest, work_dir, auth_header):
 
     if os.path.isdir(target):
         ok, err = run_git(["-C", target, "remote", "update", "--prune"], auth_header)
-        return ok, ("" if ok else "갱신: " + err)
+        return ok, ("" if ok else "갱신: " + explain_git_error(err))
 
     # 임시 경로에 받은 뒤 이동하여 중간 실패 시 깨진 미러가 남지 않게 한다.
     tmp = os.path.join(work_dir, name)
@@ -340,6 +356,7 @@ def dry_run(token, dest):
     renames = find_renames(repos, load_id_map(dest), dest)
 
     new_count = update_count = fail_count = 0
+    owner_error = False
     for repo_id, full_name in repos:
         name = repo_dir_name(full_name)
         if name is None:
@@ -352,17 +369,31 @@ def dry_run(token, dest):
         if not ok:
             log("[dry-run] 실패(%s): 접근 불가: %s" % (full_name, err))
             fail_count += 1
+            continue
+
+        local = os.path.join(dest, renames.get(str(repo_id), name))
+        has_local = os.path.isdir(local)
+        if has_local:
+            # 소유자가 다르거나 git 저장소가 아닌 폴더는 실제 실행에서도 갱신에 실패한다.
+            ok, err = run_git(["-C", local, "rev-parse", "--git-dir"], auth_header)
+        if not ok:
+            err = explain_git_error(err)
+            log("[dry-run] 실패(%s): %s" % (full_name, err))
+            fail_count += 1
+            owner_error = owner_error or err == OWNER_ERROR
         elif str(repo_id) in renames:
             log("[dry-run] 갱신 예정: %s (이름 변경: %s → %s)"
                 % (full_name, renames[str(repo_id)], name))
             update_count += 1
-        elif os.path.isdir(os.path.join(dest, name)):
+        elif has_local:
             log("[dry-run] 갱신 예정: " + full_name)
             update_count += 1
         else:
             log("[dry-run] 신규 클론 예정: " + full_name)
             new_count += 1
 
+    if owner_error:
+        log_owner_hint(dest)
     log("[dry-run] 완료: 신규 클론 %d, 갱신 %d, 실패 %d (저장소 변경 없음)"
         % (new_count, update_count, fail_count))
     return 0 if fail_count == 0 else 1
@@ -465,6 +496,7 @@ def main(argv=None):
 
         ok_count = 0
         fail_count = 0
+        owner_error = False
         for repo_id, full_name in repos:
             ok, err = backup_repo(full_name, dest, work_dir, auth_header)
             if ok:
@@ -473,7 +505,10 @@ def main(argv=None):
             else:
                 log("실패(%s): %s" % (full_name, err))
                 fail_count += 1
+                owner_error = owner_error or OWNER_ERROR in err
         save_id_map(dest, id_map)
+        if owner_error:
+            log_owner_hint(dest)
 
         log("완료: 성공 %d, 실패 %d" % (ok_count, fail_count))
         if fail_count:
